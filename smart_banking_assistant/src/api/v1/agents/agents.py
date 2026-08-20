@@ -1,0 +1,353 @@
+import os
+import uuid
+from src.api.v1.tools.input_guardrail import check_input_toxicity
+from src.api.v1.tools.input_guardrail import input_guardrail
+from src.api.v1.tools.output_guardrail import output_guardrail
+from langgraph.graph import StateGraph, START, END
+from src.api.v1.states.rag_state import RAGState
+from src.core.llm import get_llm
+from langchain_core.messages import HumanMessage, AIMessage
+from src.core.checkpointer import checkpointer
+from src.api.v1.tools.classifier_tool import classifier_tool
+from src.api.v1.tools.memory_tool import load_memory, save_memory
+from src.api.v1.tools.evaluation_tool import evaluation_node
+from src.api.v1.tools.search_tool import (
+    search_tool,
+    rewrite_query,
+)
+from src.api.v1.tools.response_tool import (
+    response_generator_tool,
+)
+from src.api.v1.tools.sql_tool import (
+    sql_generator_tool,
+    sql_validator_tool,
+    sql_executor_tool,
+)
+
+
+def route_after_input_guardrail(state: RAGState):
+    """
+    Routes the query based on input toxicity guardrail result.
+    """
+    status = state.get(
+        "input_guardrail_status",
+        "safe",
+    )
+    if status == "blocked":
+        return "blocked"
+    return "safe"
+
+
+def route_query(state: RAGState):
+    """
+    Routes the classified query to the appropriate graph path.
+    """
+    query_type = state.get("query_type", "out_of_scope")
+    allowed_types = {
+        "rag",
+        "sql",
+        "hybrid",
+        "conversation",
+        "out_of_scope",
+    }
+    if query_type not in allowed_types:
+        return "out_of_scope"
+    return query_type
+
+
+def conversation_node(state: RAGState) -> RAGState:
+    llm = get_llm()
+    history = state.get("chat_history") or []
+    print("CONVERSATION HISTORY:", history)
+    messages = [
+        {
+            "role": "system",
+            "content": """
+            You are a Smart Banking Assistant.
+            For conversation queries:
+            - Use the conversation history.
+            - Remember information explicitly provided by the user.
+            - If the user says anything remember that name.
+            - If the user asks answer using the conversation history.
+            - Do not use RAG.
+            - Do not use SQL.
+            - Do not invent information.
+            - Relevant long-term memory may be used for personalization, but it is not a source of banking facts.
+            """,
+        }
+    ]
+    memory_context = state.get("memory_context", "")
+    if memory_context:
+        messages.append(
+            {
+                "role": "system",
+                "content": "Relevant long-term memory for personalization:\n"
+                + memory_context,
+            }
+        )
+    messages.extend(history)
+    messages.append({"role": "user", "content": state["question"]})
+    response = llm.invoke(messages)
+    answer = response.content
+    state["answer"] = answer
+    state["confidence_score"] = 1.0
+    # Persist this turn
+    history.append(HumanMessage(content=state["question"]))
+    history.append(AIMessage(content=answer))
+    state["chat_history"] = history
+    # print("CONVERSATION RESPONSE:", repr(answer))
+    return state
+
+
+def out_of_scope_node(state: RAGState) -> RAGState:
+    """
+    Handles queries outside the Smart Banking domain.
+    """
+    state["answer"] = """
+    I can help with Smart Banking related questions,
+        including banking products, policies, customer accounts,
+        transactions, loans, cards, and related information."""
+    return state
+
+
+RETRY_THRESHOLD = 0.10
+
+
+def check_retrieval(state: RAGState):
+    """
+    Checks the quality of reranked RAG results.
+    Decision:
+        Good retrieval
+            -> response / SQL depending on query type
+        Poor retrieval
+            -> retry search
+        Max retries reached
+            -> continue without another retry
+    """
+    chunks = state.get("reranked_chunks", [])
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 2)
+    print("RERANKED CHUNKS:", len(chunks))
+    if not chunks:
+        if retry_count < max_retries:
+            print(f"NO CHUNKS -> RETRY #{retry_count + 1}")
+            return "retry"
+        print("MAX RETRIES REACHED -> CONTINUE")
+        return "response"
+    best_score = max(chunk.get("rerank_score", 0.0) for chunk in chunks)
+    print("BEST RERANK SCORE:", round(best_score, 4))
+    if best_score >= RETRY_THRESHOLD:
+        print("RETRIEVAL ACCEPTED")
+        return "response"
+    if retry_count < max_retries:
+        print(f"LOW CONFIDENCE -> RETRY #{retry_count + 1}")
+        return "retry"
+    print("MAX RETRIES REACHED -> CONTINUE")
+    return "response"
+
+
+def retry_search_node(state: RAGState) -> RAGState:
+    """
+    Generates an alternate search query.
+    Important:
+        - Original question remains unchanged.
+        - Only search_query is replaced.
+        - retry_count is incremented.
+        - Maximum retries are controlled by max_retries.
+    """
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 2)
+    if retry_count >= max_retries:
+        print("RETRY LIMIT REACHED")
+        return state
+    rewritten_query = rewrite_query(state)
+    if not rewritten_query:
+        print("QUERY REWRITE FAILED")
+        return state
+    state["retry_count"] = retry_count + 1
+    state.setdefault("rewritten_queries", []).append(rewritten_query)
+    state["search_query"] = rewritten_query
+    print(f"RETRY #{state['retry_count']}: " f"{rewritten_query}")
+    return state
+
+
+def route_after_retry(state: RAGState):
+    """
+    Routes the rewritten query back to the correct
+    retrieval pipeline.
+    RAG:
+        retry -> search
+    HYBRID:
+        retry -> hybrid_search
+    """
+    query_type = state.get("query_type", "rag")
+    if query_type == "hybrid":
+        return "hybrid_search"
+    return "search"
+
+
+def hybrid_search_node(state: RAGState) -> RAGState:
+    """
+    Executes the RAG portion of a Hybrid query.
+    Expected search_tool pipeline:
+        Vector+FTS - RRF - RERANKER
+    """
+    return search_tool(state)
+
+
+def merge_context_tool(state: RAGState) -> RAGState:
+    """
+    Combines RAG and SQL results for Hybrid queries.
+    """
+    rag_context = state.get("reranked_chunks", [])
+    sql_context = state.get("sql_result", [])
+    state["final_context"] = {
+        "rag_context": rag_context,
+        "sql_context": sql_context,
+    }
+    print("HYBRID CONTEXT MERGED")
+    print("RAG CONTEXT:", len(rag_context))
+    print("SQL CONTEXT:", len(sql_context))
+    return state
+
+
+def route_after_sql(state: RAGState):
+    query_type = state.get("query_type", "")
+    if query_type == "hybrid":
+        return "merge_context"
+    return "response"
+
+
+def build_graph():
+    workflow = StateGraph(RAGState)
+    workflow.add_node("classifier", classifier_tool)
+    workflow.add_node("input_guardrail", input_guardrail)
+    workflow.add_node("memory_load", load_memory)
+    workflow.add_node("memory_save", save_memory)
+    workflow.add_node("conversation", conversation_node)
+    workflow.add_node("out_of_scope", out_of_scope_node)
+    workflow.add_node("search", search_tool)
+    workflow.add_node("retry_search", retry_search_node)
+    workflow.add_node("hybrid_search", hybrid_search_node)
+    workflow.add_node("sql_generator", sql_generator_tool)
+    workflow.add_node("sql_validator", sql_validator_tool)
+    workflow.add_node("sql_executor", sql_executor_tool)
+    workflow.add_node("merge_context", merge_context_tool)
+    workflow.add_node("response_generator", response_generator_tool)
+    workflow.add_node("output_guardrail", output_guardrail)
+    workflow.add_node("evaluation", evaluation_node)
+
+    workflow.add_edge(START, "input_guardrail")
+    workflow.add_conditional_edges(
+        "input_guardrail",
+        route_after_input_guardrail,
+        {"safe": "memory_load", "blocked": END},
+    )
+    workflow.add_edge("memory_load", "classifier")
+    workflow.add_conditional_edges(
+        "classifier",
+        route_query,
+        {
+            "conversation": "conversation",
+            "out_of_scope": "out_of_scope",
+            "rag": "search",
+            "sql": "sql_generator",
+            "hybrid": "hybrid_search",
+        },
+    )
+    workflow.add_conditional_edges(
+        "search",
+        check_retrieval,
+        {
+            "retry": "retry_search",
+            "response": "response_generator",
+        },
+    )
+    workflow.add_conditional_edges(
+        "hybrid_search",
+        check_retrieval,
+        {
+            "retry": "retry_search",
+            "response": "sql_generator",
+        },
+    )
+    workflow.add_conditional_edges(
+        "retry_search",
+        route_after_retry,
+        {
+            "search": "search",
+            "hybrid_search": "hybrid_search",
+        },
+    )
+    workflow.add_edge("sql_generator", "sql_validator")
+    workflow.add_edge("sql_validator", "sql_executor")
+    workflow.add_conditional_edges(
+        "sql_executor",
+        route_after_sql,
+        {
+            "merge_context": "merge_context",
+            "response": "response_generator",
+        },
+    )
+    workflow.add_edge("merge_context", "response_generator")
+    workflow.add_edge("response_generator", "output_guardrail")
+    workflow.add_edge("output_guardrail", "evaluation")
+    workflow.add_edge("evaluation", "memory_save")
+    workflow.add_edge("memory_save", END)
+    workflow.add_edge("conversation", "memory_save")
+    workflow.add_edge("out_of_scope", "memory_save")
+
+    return workflow.compile(checkpointer=checkpointer)
+
+
+banking_agent = build_graph()
+
+
+# graph_image = banking_agent.get_graph().draw_mermaid_png()
+# with open("banking_agent.png", "wb") as f:
+#     f.write(graph_image)
+
+
+def invoke(
+    question: str,
+    account_id: str | None = None,
+    thread_id: str | None = None,
+):
+    state = RAGState(
+        question=question,
+        search_query=question,
+        account_id=account_id,
+        thread_id=thread_id,
+        query_type="",
+        retrieved_chunks=[],
+        fts_chunks=[],
+        hybrid_chunks=[],
+        reranked_chunks=[],
+        rewritten_queries=[],
+        sql_query="",
+        validated_sql="",
+        sql_result=[],
+        answer="",
+        citations=[],
+        response_sources=[],
+        confidence_score=0.0,
+        evaluation={},
+        evaluation_score=0.0,
+        evaluation_status="",
+        retry_count=0,
+        max_retries=2,
+        final_context={},
+        trace_id="",
+    )
+    run_id = uuid.uuid4()
+    state["trace_id"] = str(run_id)
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+        },
+        "run_id": run_id,
+    }
+    return banking_agent.invoke(
+        state,
+        config=config,
+    )

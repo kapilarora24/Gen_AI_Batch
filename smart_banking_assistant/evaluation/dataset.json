@@ -1,0 +1,37 @@
+[
+  {
+    "id": "kyc_001",
+    "question": "What are the KYC requirements for opening an account?",
+    "expected_query_type": "rag",
+    "expected_keywords": ["KYC"],
+    "must_have_citation": true
+  },
+  {
+    "id": "balance_001",
+    "question": "Show my account balance.",
+    "expected_query_type": "sql",
+    "expected_keywords": ["balance"],
+    "must_have_citation": false
+  },
+  {
+    "id": "loan_001",
+    "question": "Show my loan balance and explain the foreclosure policy.",
+    "expected_query_type": "hybrid",
+    "expected_keywords": ["loan"],
+    "must_have_citation": true
+  },
+  {
+    "id": "conversation_001",
+    "question": "Hello, my name is Alex.",
+    "expected_query_type": "conversation",
+    "expected_keywords": ["Alex"],
+    "must_have_citation": false
+  },
+  {
+    "id": "out_of_scope_001",
+    "question": "Who won yesterday's football match?",
+    "expected_query_type": "out_of_scope",
+    "expected_keywords": ["bank"],
+    "must_have_citation": false
+  }
+]
